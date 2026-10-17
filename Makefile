@@ -10,7 +10,7 @@ config:
 	@test -f config.yml || cp config.yml.example config.yml && echo "config.yml ready, fill it in"
 
 install:
-	pip install pyyaml
+	pip install -r requirements.txt
 
 deploy:
 	python3 deploy.py
