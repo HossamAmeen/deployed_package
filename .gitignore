@@ -9,3 +9,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Sample projects, kept out of this repo
+frontend/
+backend/

@@ -1,3 +1,45 @@
-ip: 136.71.142.35
-username: hossam
-ssh_file: ~/.ssh/google_compute_engine
+staging:
+  ip: 136.71.142.35
+  username: hossam
+  ssh_file: ~/.ssh/google_compute_engine
+  docker: false                      # true: run both projects with docker compose instead of systemd/venv
+
+  frontend:
+    domain: deploy.hossam-ameen.online
+    git_url: https://github.com/HossamAmeen/deployed_frontend.git
+    branch: main
+    remote_path: /var/www/deployed   # checkout on the server (without docker nginx serves <remote_path>/dist)
+    port: 8080                       # docker only: local port of the frontend container
+    # api_url: http://api.deploy.hossam-ameen.online  # optional, defaults to http://<backend.domain>
+
+  backend:
+    domain: api.deploy.hossam-ameen.online
+    git_url: https://github.com/HossamAmeen/deploy_backend.git
+    branch: main
+    remote_path: /opt/deployed/backend
+    service_name: deployed-backend   # systemd service name (docker: compose project name)
+    port: 8000                       # local port the backend listens on
+    wsgi_module: config.wsgi:application  # not used with docker (set in the backend Dockerfile)
+
+production:
+  ip: 203.0.113.10
+  username: ubuntu
+  ssh_file: ~/.ssh/id_rsa
+  docker: false
+
+  frontend:
+    domain: example.com
+    git_url: https://github.com/HossamAmeen/deployed_frontend.git
+    branch: main
+    remote_path: /var/www/app
+    port: 8080
+    # api_url: https://api.example.com
+
+  backend:
+    domain: api.example.com
+    git_url: https://github.com/HossamAmeen/deploy_backend.git
+    branch: main
+    remote_path: /opt/app/backend
+    service_name: app-backend
+    port: 8000
+    wsgi_module: config.wsgi:application

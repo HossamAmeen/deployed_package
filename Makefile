@@ -1,19 +1,22 @@
+ENV ?= staging
+
 .PHONY: help deploy deploy-sh install config
 
 help:
-	@echo "make config      - create config.yml from config.yml.example"
+	@echo "make config      - overwrite config.yml with config.yml.example"
 	@echo "make install     - install Python dependencies"
-	@echo "make deploy      - run the Python deploy script"
-	@echo "make deploy-sh   - run the shell deploy script"
+	@echo "make deploy      - deploy (ENV=staging|production, default staging)"
+	@echo "make deploy-sh   - same, via the shell script"
 
 config:
-	@test -f config.yml || cp config.yml.example config.yml && echo "config.yml ready, fill it in"
+	cp config.yml.example config.yml
+	@echo "config.yml replaced from config.yml.example"
 
 install:
 	pip install -r requirements.txt
 
 deploy:
-	python3 deploy.py
+	python3 deploy.py $(ENV)
 
 deploy-sh:
-	./deploy.sh
+	./deploy.sh $(ENV)
