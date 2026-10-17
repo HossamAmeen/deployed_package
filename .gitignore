@@ -1,0 +1,11 @@
+config.yml
+*.pem
+*.key
+id_rsa*
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
