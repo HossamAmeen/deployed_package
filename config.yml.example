@@ -2,7 +2,9 @@ staging:
   ip: 136.71.142.35
   username: hossam
   ssh_file: ~/.ssh/google_compute_engine
-  docker: false                      # true: run both projects with docker compose instead of systemd/venv
+  docker: true                      # true: run both projects with docker compose instead of systemd/venv
+  ssl: false                         # true: install Let's Encrypt certificates (domains must point to this server)
+  ssl_email: hosamameen948@gmail.com         # required when ssl: true
 
   frontend:
     domain: deploy.hossam-ameen.online
@@ -10,6 +12,8 @@ staging:
     branch: main
     remote_path: /var/www/deployed   # checkout on the server (without docker nginx serves <remote_path>/dist)
     port: 8080                       # docker only: local port of the frontend container
+    dockerfile: docker/staging/Dockerfile           # docker only: path inside the repo
+    compose_file: docker/staging/docker-compose.yml # docker only: path inside the repo
     # api_url: http://api.deploy.hossam-ameen.online  # optional, defaults to http://<backend.domain>
 
   backend:
@@ -18,7 +22,9 @@ staging:
     branch: main
     remote_path: /opt/deployed/backend
     service_name: deployed-backend   # systemd service name (docker: compose project name)
-    port: 8000                       # local port the backend listens on
+    port: 8001                       # local port the backend listens on
+    dockerfile: docker/staging/Dockerfile           # docker only: path inside the repo
+    compose_file: docker/staging/docker-compose.yml # docker only: path inside the repo
     wsgi_module: config.wsgi:application  # not used with docker (set in the backend Dockerfile)
 
 production:
@@ -26,6 +32,8 @@ production:
   username: ubuntu
   ssh_file: ~/.ssh/id_rsa
   docker: false
+  ssl: false
+  ssl_email: you@example.com
 
   frontend:
     domain: example.com
@@ -33,6 +41,8 @@ production:
     branch: main
     remote_path: /var/www/app
     port: 8080
+    dockerfile: docker/production/Dockerfile
+    compose_file: docker/production/docker-compose.yml
     # api_url: https://api.example.com
 
   backend:
@@ -42,4 +52,6 @@ production:
     remote_path: /opt/app/backend
     service_name: app-backend
     port: 8000
+    dockerfile: docker/production/Dockerfile
+    compose_file: docker/production/docker-compose.yml
     wsgi_module: config.wsgi:application
