@@ -12,6 +12,7 @@
 import argparse
 import http.client
 import json
+import posixpath
 import shlex
 import shutil
 import socket
@@ -26,6 +27,31 @@ import yaml  # pip install pyyaml
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "config.yml"
 ENVIRONMENTS = ("staging", "production")
+
+
+def app_dir(side):
+    """Folder of a project on the server: the checkout, plus `subdir` for a monorepo."""
+    return posixpath.join(side["remote_path"], side["subdir"]) if side.get("subdir") else side["remote_path"]
+
+
+def backend_settings(be, docker):
+    """Worker count and static/media settings of the backend, with defaults.
+    With docker the folders are mounted from <project>/staticfiles and <project>/media."""
+    path = app_dir(be)
+    host_static = be.get("static_root") or posixpath.join(path, "staticfiles")
+    host_media = be.get("media_root") or posixpath.join(path, "media")
+    if docker:
+        host_static, host_media = posixpath.join(path, "staticfiles"), posixpath.join(path, "media")
+    return {
+        "workers": int(be.get("workers", 2)),
+        "static_url": be.get("static_url", "/static/"),
+        "media_url": be.get("media_url", "/media/"),
+        "static_root": host_static,   # folder on the server that nginx serves
+        "media_root": host_media,
+        # what Django sees (inside the container with docker)
+        "django_static_root": "/app/staticfiles" if docker else host_static,
+        "django_media_root": "/app/media" if docker else host_media,
+    }
 
 
 def load_config(env):
@@ -46,6 +72,18 @@ def load_config(env):
         missing += [f"{section + '.' if section else ''}{k}" for k in keys if not node.get(k)]
     if missing:
         sys.exit(f"Missing in {CONFIG.name} ({env}): {', '.join(missing)}")
+    # `domain` may be one name or a list; the first is the primary one used for checks and URLs
+    for side in ("frontend", "backend"):
+        names = cfg[side]["domain"]
+        cfg[side]["domains"] = [names] if isinstance(names, str) else list(names)
+        cfg[side]["domain"] = cfg[side]["domains"][0]
+
+    web_root = cfg["frontend"].get("web_root")
+    if web_root:
+        fe_dir = app_dir(cfg["frontend"])
+        if not posixpath.isabs(web_root) or posixpath.normpath(web_root) in ("/", posixpath.normpath(fe_dir)):
+            sys.exit(f"frontend.web_root must be an absolute path other than '/' or the frontend project folder "
+                     f"({CONFIG.name}, {env}): it is emptied on every deploy")
     if cfg.get("ssl") and not cfg.get("ssl_email"):
         sys.exit(f"Missing in {CONFIG.name} ({env}): ssl_email (required when ssl: true)")
 
@@ -145,12 +183,25 @@ def already_provisioned(srv, cfg, docker):
 
 def prepare_dirs(srv, cfg):
     user = cfg["username"]
-    for path in (cfg["frontend"]["remote_path"], cfg["backend"]["remote_path"]):
+    fe = cfg["frontend"]
+    paths = {fe["remote_path"], cfg["backend"]["remote_path"]}
+    if fe.get("web_root"):
+        paths.add(fe["web_root"])
+    for path in sorted(paths):
         srv.run(f"sudo mkdir -p {shlex.quote(path)} && sudo chown -R {user}: {shlex.quote(path)}")
 
 
+_synced = set()
+
+
 def git_sync(srv, remote_path, git_url, branch):
-    """Clone on first run, `git pull` afterwards."""
+    """Clone on first run, `git pull` afterwards. A repo shared by the frontend and
+    the backend (same folder, URL and branch) is only synced once."""
+    key = (remote_path, git_url, branch)
+    if key in _synced:
+        print(f"  {remote_path} is shared with the other project: already up to date")
+        return
+    _synced.add(key)
     path, url, br = shlex.quote(remote_path), shlex.quote(git_url), shlex.quote(branch)
     srv.run(f"""
 cd {path}
@@ -167,11 +218,19 @@ fi
 """)
 
 
-def proxy_conf(domain, port):
+def proxy_conf(domains, port, files=()):
+    """nginx server block proxying to a local port; `files` is a list of (url, folder)
+    pairs served directly by nginx (static and media files)."""
+    file_locations = "".join(f"""
+    location {url} {{
+        alias {folder.rstrip("/")}/;
+    }}
+""" for url, folder in files)
     return f"""server {{
     listen 80;
-    server_name {domain};
-
+    server_name {" ".join(domains)};
+    client_max_body_size 50m;
+{file_locations}
     location / {{
         proxy_pass http://127.0.0.1:{port};
         proxy_set_header Host $host;
@@ -183,42 +242,62 @@ def proxy_conf(domain, port):
 """
 
 
-def deploy_frontend(srv, cfg, docker):
+def build_frontend(srv, cfg, docker):
+    """Pull the frontend and build/start it. Does not touch the nginx config."""
     fe, be = cfg["frontend"], cfg["backend"]
     api_url = fe.get("api_url") or f"{scheme(cfg)}://{be['domain']}"
     port = fe.get("port", 8080)
     dockerfile = fe.get("dockerfile", f"docker/{cfg['_env']}/Dockerfile")
     compose_file = fe.get("compose_file", f"docker/{cfg['_env']}/docker-compose.yml")
-    path = shlex.quote(fe["remote_path"])
-    conf = f"/etc/nginx/conf.d/{be['service_name']}-frontend.conf"
+    path = shlex.quote(app_dir(fe))
+    web_root = fe.get("web_root")
 
     step(f"Updating frontend from git ({fe['git_url']})")
     git_sync(srv, fe["remote_path"], fe["git_url"], fe.get("branch", "main"))
 
     if docker:
-        step(f"Starting frontend with docker compose (VITE_API_URL={api_url})")
+        step(f"Starting frontend with docker compose (VITE_API_BASE_URL={api_url})")
         srv.run(f"""
 cd {path}
-printf 'VITE_API_URL=%s\\nFRONTEND_PORT=%s\\nDOCKERFILE=%s\\n' {shlex.quote(api_url)} {port} {shlex.quote(dockerfile)} > .env
+printf 'VITE_API_BASE_URL=%s\\nFRONTEND_PORT=%s\\nDOCKERFILE=%s\\n' {shlex.quote(api_url)} {port} {shlex.quote(dockerfile)} > .env
 sudo docker compose -f {shlex.quote(compose_file)} --env-file .env -p {shlex.quote(be['service_name'] + '-frontend')} up -d --build
 """)
-        srv.write_file(conf, proxy_conf(fe["domain"], port))
         return
 
-    step(f"Building frontend on the server (VITE_API_URL={api_url})")
+    step(f"Building frontend on the server (VITE_API_BASE_URL={api_url})")
     srv.run(f"""
 cd {path}
-export VITE_API_URL={shlex.quote(api_url)}
+export VITE_API_BASE_URL={shlex.quote(api_url)}
 if [ -f package-lock.json ]; then npm ci; else npm install; fi
 npm run build
 """)
 
+    if web_root:
+        step(f"Publishing dist to {web_root}")
+        srv.run(f"""
+cd {path}
+mkdir -p {shlex.quote(web_root)}
+find {shlex.quote(web_root)} -mindepth 1 -delete
+cp -a dist/. {shlex.quote(web_root)}/
+""")
+
+
+def deploy_frontend(srv, cfg, docker):
+    fe, be = cfg["frontend"], cfg["backend"]
+    conf = f"/etc/nginx/conf.d/{be['service_name']}-frontend.conf"
+    build_frontend(srv, cfg, docker)
+
+    if docker:
+        srv.write_file(conf, proxy_conf(fe["domains"], fe.get("port", 8080)))
+        return
+
     step("Configuring nginx for frontend")
+    web_root = fe.get("web_root")
     srv.write_file(conf, f"""server {{
     listen 80;
-    server_name {fe['domain']};
+    server_name {" ".join(fe['domains'])};
 
-    root {fe['remote_path']}/dist;
+    root {web_root or app_dir(fe) + '/dist'};
     index index.html;
 
     location / {{
@@ -228,17 +307,39 @@ npm run build
 """)
 
 
+def django_release(srv, cfg, docker):
+    """Django release tasks shared by deploy.py and restart.py: migrate and collectstatic.
+    The backend code must already be pulled (and the container running with docker)."""
+    be = cfg["backend"]
+    path = shlex.quote(app_dir(be))
+    if docker:
+        compose_file = be.get("compose_file", f"docker/{cfg['_env']}/docker-compose.yml")
+        manage = (f"sudo docker compose -f {shlex.quote(compose_file)} --env-file .env "
+                  f"-p {shlex.quote(be['service_name'])} exec -T backend python manage.py")
+        prefix = ""
+    else:
+        manage = "venv/bin/python manage.py"
+        prefix = "set -a; . ./.env; set +a\n"
+    step("Running migrate")
+    srv.run(f"cd {path}\n{prefix}{manage} migrate --noinput")
+    step("Running collectstatic")
+    srv.run(f"cd {path}\n{prefix}{manage} collectstatic --noinput")
+
+
 def deploy_backend(srv, cfg, docker):
     be, fe = cfg["backend"], cfg["frontend"]
-    path, name, user = be["remote_path"], be["service_name"], cfg["username"]
+    path, name, user = app_dir(be), be["service_name"], cfg["username"]
     port = be.get("port", 8000)
     wsgi = be.get("wsgi_module", "config.wsgi:application")
+    # requirements_path is relative to the backend project folder (<remote_path>/<subdir>)
+    requirements = posixpath.join(path, be.get("requirements_path", "requirements.txt"))
     dockerfile = be.get("dockerfile", f"docker/{cfg['_env']}/Dockerfile")
     compose_file = be.get("compose_file", f"docker/{cfg['_env']}/docker-compose.yml")
     q = shlex.quote(path)
+    opts = backend_settings(be, docker)
 
     step(f"Updating backend from git ({be['git_url']})")
-    git_sync(srv, path, be["git_url"], be.get("branch", "main"))
+    git_sync(srv, be["remote_path"], be["git_url"], be.get("branch", "main"))
 
     step("Writing backend environment")
     # Hosts/CORS come from the domains in config.yml; the secret key is generated
@@ -247,11 +348,17 @@ def deploy_backend(srv, cfg, docker):
 cd {q}
 touch .env && chmod 600 .env
 grep -q '^DJANGO_SECRET_KEY=' .env || echo "DJANGO_SECRET_KEY=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 50)" >> .env
-sed -i '/^DJANGO_ALLOWED_HOSTS=/d;/^CORS_ALLOWED_ORIGINS=/d;/^BACKEND_PORT=/d;/^DOCKERFILE=/d' .env
-echo 'DJANGO_ALLOWED_HOSTS={be["domain"]}' >> .env
-echo 'CORS_ALLOWED_ORIGINS={scheme(cfg)}://{fe["domain"]}' >> .env
+sed -i '/^DJANGO_ALLOWED_HOSTS=/d;/^CORS_ALLOWED_ORIGINS=/d;/^BACKEND_PORT=/d;/^DOCKERFILE=/d;/^GUNICORN_WORKERS=/d;/^DJANGO_STATIC_URL=/d;/^DJANGO_STATIC_ROOT=/d;/^DJANGO_MEDIA_URL=/d;/^DJANGO_MEDIA_ROOT=/d' .env
+echo 'DJANGO_ALLOWED_HOSTS={",".join(be["domains"])}' >> .env
+echo 'CORS_ALLOWED_ORIGINS={",".join(scheme(cfg) + "://" + d for d in fe["domains"])}' >> .env
 echo 'BACKEND_PORT={port}' >> .env
 echo 'DOCKERFILE={dockerfile}' >> .env
+echo 'GUNICORN_WORKERS={opts["workers"]}' >> .env
+echo 'DJANGO_STATIC_URL={opts["static_url"]}' >> .env
+echo 'DJANGO_STATIC_ROOT={opts["django_static_root"]}' >> .env
+echo 'DJANGO_MEDIA_URL={opts["media_url"]}' >> .env
+echo 'DJANGO_MEDIA_ROOT={opts["django_media_root"]}' >> .env
+mkdir -p {shlex.quote(opts["static_root"])} {shlex.quote(opts["media_root"])}
 """)
 
     if docker:
@@ -261,16 +368,16 @@ cd {q}
 mkdir -p data
 sudo docker compose -f {shlex.quote(compose_file)} --env-file .env -p {shlex.quote(name)} up -d --build
 """)
+        django_release(srv, cfg, docker)
     else:
-        step("Installing dependencies and migrating")
+        step(f"Installing dependencies from {requirements}")
         srv.run(f"""
 cd {q}
 [ -d venv ] || python3 -m venv venv
 venv/bin/pip install -q --upgrade pip
-venv/bin/pip install -q -r requirements.txt
-set -a; . ./.env; set +a
-venv/bin/python manage.py migrate --noinput
+venv/bin/pip install -q -r {shlex.quote(requirements)}
 """)
+        django_release(srv, cfg, docker)
 
         step(f"Setting up systemd service {name}")
         unit = f"/etc/systemd/system/{name}.service"
@@ -283,7 +390,7 @@ After=network.target
 User={user}
 WorkingDirectory={path}
 EnvironmentFile={path}/.env
-ExecStart={path}/venv/bin/gunicorn {wsgi} --bind 127.0.0.1:{port} --workers 2
+ExecStart={path}/venv/bin/gunicorn {wsgi} --bind 127.0.0.1:{port} --workers {opts['workers']}
 Restart=always
 
 [Install]
@@ -317,7 +424,8 @@ echo "ok: {name} is listening on port {port}"
 """)
 
     step("Configuring nginx for backend")
-    srv.write_file(f"/etc/nginx/conf.d/{name}-backend.conf", proxy_conf(be["domain"], port))
+    files = [(opts["static_url"], opts["static_root"]), (opts["media_url"], opts["media_root"])]
+    srv.write_file(f"/etc/nginx/conf.d/{name}-backend.conf", proxy_conf(be["domains"], port, files))
 
 
 def reload_nginx(srv):
@@ -383,7 +491,7 @@ def verify(cfg):
         print(f"  {line}")
         lines.append(line)
 
-    for domain in (fe["domain"], be["domain"]):
+    for domain in fe["domains"] + be["domains"]:
         points, addrs = dns_points_to_server(domain, ip)
         if points:
             report(f"[ok] DNS {domain} -> {ip}")
@@ -415,7 +523,7 @@ def verify(cfg):
 
 
 def setup_ssl(srv, cfg):
-    """Get a Let's Encrypt certificate for each domain that points at the server."""
+    """Get Let's Encrypt certificates for all frontend and backend domains."""
     step("Installing SSL certificates (Let's Encrypt)")
     srv.run(r"""
 if ! command -v certbot >/dev/null 2>&1; then
@@ -426,13 +534,20 @@ if ! command -v certbot >/dev/null 2>&1; then
     fi
 fi
 """)
-    for domain in (cfg["frontend"]["domain"], cfg["backend"]["domain"]):
-        points, addrs = dns_points_to_server(domain, cfg["ip"])
-        if not points:
-            print(f"  [warn] skipping {domain}: DNS does not point to {cfg['ip']} (certbot would fail)")
+    # One certificate per site, covering all of its domains that point at this server.
+    for side in ("frontend", "backend"):
+        ready = []
+        for domain in cfg[side]["domains"]:
+            if dns_points_to_server(domain, cfg["ip"])[0]:
+                ready.append(domain)
+            else:
+                print(f"  [warn] skipping {domain}: DNS does not point to {cfg['ip']} (certbot would fail)")
+        if not ready:
             continue
+        names = " ".join(f"-d {shlex.quote(d)}" for d in ready)
+        print(f"  {side}: {', '.join(ready)}")
         srv.run(f"sudo certbot --nginx --non-interactive --agree-tos --redirect "
-                f"-m {shlex.quote(cfg['ssl_email'])} -d {shlex.quote(domain)}")
+                f"-m {shlex.quote(cfg['ssl_email'])} {names}")
 
 
 def notify(cfg, title, message, ok):
@@ -441,6 +556,40 @@ def notify(cfg, title, message, ok):
         urgency = "normal" if ok else "critical"
         subprocess.run(["notify-send", "-u", urgency, title, message],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def print_paths(cfg, docker):
+    """Show where everything lives on the server."""
+    fe, be = cfg["frontend"], cfg["backend"]
+    name = be["service_name"]
+    served = "(docker container)" if docker else (fe.get("web_root") or app_dir(fe) + "/dist")
+    rows = [
+        ("Frontend project", app_dir(fe)),
+        ("Frontend served from", served),
+        ("Backend project", app_dir(be)),
+        ("Backend .env", app_dir(be) + "/.env"),
+    ]
+    if docker:
+        rows.append(("Backend containers", f"docker compose project '{name}'"))
+    else:
+        rows += [("Backend service", f"{name}  (/etc/systemd/system/{name}.service)")]
+    opts = backend_settings(be, docker)
+    rows += [
+        ("Static URL -> folder", f"{opts['static_url']}  ->  {opts['static_root']}"),
+        ("Media URL -> folder", f"{opts['media_url']}  ->  {opts['media_root']}"),
+    ]
+    rows += [
+        ("nginx frontend conf", f"/etc/nginx/conf.d/{name}-frontend.conf"),
+        ("nginx backend conf", f"/etc/nginx/conf.d/{name}-backend.conf"),
+    ]
+    rows += [
+        ("Frontend domains", ", ".join(fe["domains"])),
+        ("Backend domains", ", ".join(be["domains"])),
+    ]
+    width = max(len(k) for k, _ in rows)
+    print(f"Paths on {cfg['ip']}:")
+    for k, v in rows:
+        print(f"  {k:<{width}}  {v}")
 
 
 def main():
@@ -461,6 +610,7 @@ def main():
     srv = Server(cfg)
     docker = bool(cfg.get("docker", False))
     print(f"Deploying {env} to {srv.target} ({'docker' if docker else 'systemd'})")
+    print_paths(cfg, docker)
 
     try:
         if not args.full and already_provisioned(srv, cfg, docker):
@@ -479,6 +629,8 @@ def main():
         raise
 
     sch = scheme(cfg)
+    print()
+    print_paths(cfg, docker)
     print(f"\nDone.\n  Frontend: {sch}://{cfg['frontend']['domain']}\n  Backend:  {sch}://{cfg['backend']['domain']}/api/health/")
     notify(cfg, f"Deploy {env} {'OK' if healthy else 'FAILED'}", "\n".join(lines), ok=healthy)
     if not healthy:

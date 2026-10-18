@@ -2,15 +2,18 @@ staging:
   ip: 136.71.142.35
   username: hossam
   ssh_file: ~/.ssh/google_compute_engine
-  docker: true                      # true: run both projects with docker compose instead of systemd/venv
+  docker: false                      # true: run both projects with docker compose instead of systemd/venv
   ssl: false                         # true: install Let's Encrypt certificates (domains must point to this server)
   ssl_email: hosamameen948@gmail.com         # required when ssl: true
 
   frontend:
-    domain: deploy.hossam-ameen.online
+    domain: deploy.hossam-ameen.online   # one name, or a list: [example.com, www.example.com]
     git_url: https://github.com/HossamAmeen/deployed_frontend.git
     branch: main
-    remote_path: /var/www/deployed   # checkout on the server (without docker nginx serves <remote_path>/dist)
+    remote_path: /var/www/deployed/staging   # checkout on the server (without docker nginx serves <remote_path>/dist)
+    # Same repo for front and back? Use the same git_url + remote_path in both sections and set subdir:
+    # subdir: front                                  # folder of the Vue project inside the repo
+    # web_root: /var/www/html/project/staging       # nginx serves this folder, it holds only the built dist
     port: 8080                       # docker only: local port of the frontend container
     dockerfile: docker/staging/Dockerfile           # docker only: path inside the repo
     compose_file: docker/staging/docker-compose.yml # docker only: path inside the repo
@@ -20,11 +23,18 @@ staging:
     domain: api.deploy.hossam-ameen.online
     git_url: https://github.com/HossamAmeen/deploy_backend.git
     branch: main
-    remote_path: /opt/deployed/backend
+    remote_path: /opt/deployed/staging
+    # subdir: back                                    # folder of the Django project inside the repo
     service_name: deployed-backend   # systemd service name (docker: compose project name)
     port: 8001                       # local port the backend listens on
+    workers: 2                       # gunicorn worker processes
+    static_url: /static/             # URL prefix of Django static files (served by nginx)
+    media_url: /media/               # URL prefix of uploaded media files (served by nginx)
+    # static_root: /var/www/app/static   # folder on the server for collectstatic output (default <backend folder>/staticfiles)
+    # media_root: /var/www/app/media     # folder on the server for uploads (default <backend folder>/media)
     dockerfile: docker/staging/Dockerfile           # docker only: path inside the repo
     compose_file: docker/staging/docker-compose.yml # docker only: path inside the repo
+    requirements_path: requirements.txt   # pip requirements file, relative to the backend folder <remote_path>/<subdir> (not used with docker)
     wsgi_module: config.wsgi:application  # not used with docker (set in the backend Dockerfile)
 
 production:
@@ -33,13 +43,16 @@ production:
   ssh_file: ~/.ssh/id_rsa
   docker: false
   ssl: false
-  ssl_email: you@example.com
+  ssl_email: hosamameen948@gmail.com 
 
   frontend:
     domain: example.com
     git_url: https://github.com/HossamAmeen/deployed_frontend.git
     branch: main
     remote_path: /var/www/app
+    # Same repo for front and back? Use the same git_url + remote_path in both sections and set subdir:
+    # subdir: front                                  # folder of the Vue project inside the repo
+    # web_root: /var/www/html/project/production       # nginx serves this folder, it holds only the built dist
     port: 8080
     dockerfile: docker/production/Dockerfile
     compose_file: docker/production/docker-compose.yml
@@ -49,9 +62,14 @@ production:
     domain: api.example.com
     git_url: https://github.com/HossamAmeen/deploy_backend.git
     branch: main
-    remote_path: /opt/app/backend
+    remote_path: /opt/deployed/production
+    # subdir: back                                    # folder of the Django project inside the repo
     service_name: app-backend
     port: 8000
+    workers: 4
+    static_url: /static/
+    media_url: /media/
     dockerfile: docker/production/Dockerfile
     compose_file: docker/production/docker-compose.yml
+    requirements_path: requirements.txt
     wsgi_module: config.wsgi:application
