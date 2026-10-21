@@ -106,6 +106,12 @@ class Server:
         cmd = ["ssh", *self.ssh_opts, self.target, "bash -s"]
         return subprocess.run(cmd, input=script, text=True, capture_output=True).returncode == 0
 
+    def output(self, script):
+        """Run a bash script on the server and return its stdout."""
+        cmd = ["ssh", *self.ssh_opts, self.target, "bash -s"]
+        return subprocess.run(cmd, input=f"set -e\n{script}", text=True, check=True,
+                              stdout=subprocess.PIPE).stdout.strip()
+
     def write_file(self, path, content):
         """Write a file on the server as root."""
         cmd = ["ssh", *self.ssh_opts, self.target, f"sudo tee {shlex.quote(path)} >/dev/null"]
@@ -240,6 +246,48 @@ def proxy_conf(domains, port, files=()):
     }}
 }}
 """
+
+
+def find_free_port(srv, start, owner, docker, avoid=()):
+    """First port >= start on the server that is free or already served by `owner`
+    (the systemd service, or the docker compose project, of this deploy)."""
+    avoid_list = " ".join(str(p) for p in avoid)
+    if docker:
+        owned = f'[ -n "$(sudo docker ps -q --filter label=com.docker.compose.project={shlex.quote(owner)} --filter publish=$p)" ]'
+    else:
+        owned = (f'pid=$(sudo ss -ltnpH "sport = :$p" | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
+                 f'[ -n "$pid" ] && grep -q {shlex.quote(owner + ".service")} /proc/$pid/cgroup')
+    out = srv.output(f"""
+for p in $(seq {start} {start + 200}); do
+    case " {avoid_list} " in *" $p "*) continue;; esac
+    if [ -z "$(sudo ss -ltnH "sport = :$p")" ] || ( {owned} ); then echo $p; exit 0; fi
+done
+echo none
+""")
+    if out == "none":
+        sys.exit(f"No free port found in {start}-{start + 200} on the server")
+    return int(out)
+
+
+def resolve_ports(srv, cfg, docker):
+    """Make sure the configured ports are not held by something else on the server;
+    if one is busy, use the next free port instead (nginx and .env follow cfg)."""
+    step("Checking ports are available")
+    fe, be = cfg["frontend"], cfg["backend"]
+    name = be["service_name"]
+    wanted = [("backend", be, name)]
+    if docker:  # without docker the frontend is static files and needs no port
+        wanted.insert(0, ("frontend", fe, name + "-frontend"))
+    taken = []
+    for side, node, owner in wanted:
+        want = int(node.get("port", 8080 if side == "frontend" else 8000))
+        got = find_free_port(srv, want, owner, docker, taken)
+        if got != want:
+            print(f"  [warn] {side} port {want} is busy: using {got} instead")
+        else:
+            print(f"  {side} port {got}: ok")
+        node["port"] = got
+        taken.append(got)
 
 
 def build_frontend(srv, cfg, docker):
@@ -618,6 +666,7 @@ def main():
         else:
             bootstrap(srv, docker)
             prepare_dirs(srv, cfg)
+        resolve_ports(srv, cfg, docker)
         deploy_frontend(srv, cfg, docker)
         deploy_backend(srv, cfg, docker)
         reload_nginx(srv)
