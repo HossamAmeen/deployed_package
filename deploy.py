@@ -395,9 +395,16 @@ def deploy_backend(srv, cfg, docker):
     srv.run(f"""
 cd {q}
 touch .env && chmod 600 .env
+grep -q '^DATABASE_URL=' .env || echo "DATABASE_URL=sqlite:///$(pwd)/db.sqlite3" >> .env
+grep -q '^HEALTH_CHECK_PASSWORD=' .env || echo "HEALTH_CHECK_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)" >> .env
 grep -q '^DJANGO_SECRET_KEY=' .env || echo "DJANGO_SECRET_KEY=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 50)" >> .env
-sed -i '/^DJANGO_ALLOWED_HOSTS=/d;/^CORS_ALLOWED_ORIGINS=/d;/^BACKEND_PORT=/d;/^DOCKERFILE=/d;/^GUNICORN_WORKERS=/d;/^DJANGO_STATIC_URL=/d;/^DJANGO_STATIC_ROOT=/d;/^DJANGO_MEDIA_URL=/d;/^DJANGO_MEDIA_ROOT=/d' .env
+sed -i '/^ALLOWED_HOSTS=/d;/^CSRF_TRUSTED_ORIGINS=/d;/^SECURE_SSL_REDIRECT=/d;/^SECURE_HSTS_SECONDS=/d;/^SECRET_KEY=/d;/^DJANGO_ALLOWED_HOSTS=/d;/^CORS_ALLOWED_ORIGINS=/d;/^BACKEND_PORT=/d;/^DOCKERFILE=/d;/^GUNICORN_WORKERS=/d;/^DJANGO_STATIC_URL=/d;/^DJANGO_STATIC_ROOT=/d;/^DJANGO_MEDIA_URL=/d;/^DJANGO_MEDIA_ROOT=/d' .env
 echo 'DJANGO_ALLOWED_HOSTS={",".join(be["domains"])}' >> .env
+echo 'ALLOWED_HOSTS={",".join(be["domains"])}' >> .env
+echo 'CSRF_TRUSTED_ORIGINS={",".join(scheme(cfg) + "://" + d for d in be["domains"] + fe["domains"])}' >> .env
+echo 'SECURE_SSL_REDIRECT={"True" if cfg.get("ssl") else "False"}' >> .env
+echo 'SECURE_HSTS_SECONDS={"31536000" if cfg.get("ssl") else "0"}' >> .env
+echo "SECRET_KEY=$(grep '^DJANGO_SECRET_KEY=' .env | cut -d= -f2-)" >> .env
 echo 'CORS_ALLOWED_ORIGINS={",".join(scheme(cfg) + "://" + d for d in fe["domains"])}' >> .env
 echo 'BACKEND_PORT={port}' >> .env
 echo 'DOCKERFILE={dockerfile}' >> .env
@@ -406,7 +413,8 @@ echo 'DJANGO_STATIC_URL={opts["static_url"]}' >> .env
 echo 'DJANGO_STATIC_ROOT={opts["django_static_root"]}' >> .env
 echo 'DJANGO_MEDIA_URL={opts["media_url"]}' >> .env
 echo 'DJANGO_MEDIA_ROOT={opts["django_media_root"]}' >> .env
-mkdir -p {shlex.quote(opts["static_root"])} {shlex.quote(opts["media_root"])}
+sudo mkdir -p {shlex.quote(opts["static_root"])} {shlex.quote(opts["media_root"])}
+sudo chown -R "$(id -un)": {shlex.quote(opts["static_root"])} {shlex.quote(opts["media_root"])}
 """)
 
     if docker:
@@ -502,7 +510,7 @@ class _HTTPSToIP(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
-def http_get(ip, domain, path, use_ssl=False, retries=10, delay=3):
+def http_get(ip, domain, path, use_ssl=False, retries=10, delay=3, headers=None):
     """GET <scheme>://<domain><path> by connecting straight to the server IP, so it
     works before DNS is set up. Returns (status, body) or (None, error)."""
     last = "no response"
@@ -512,7 +520,7 @@ def http_get(ip, domain, path, use_ssl=False, retries=10, delay=3):
                 conn = _HTTPSToIP(domain, ip, 10)
             else:
                 conn = http.client.HTTPConnection(ip, 80, timeout=10)
-            conn.request("GET", path, headers={"Host": domain})
+            conn.request("GET", path, headers={"Host": domain, **(headers or {})})
             res = conn.getresponse()
             body = res.read().decode(errors="replace")
             conn.close()
@@ -547,16 +555,25 @@ def verify(cfg):
             found = ", ".join(addrs) if addrs else "does not resolve"
             report(f"[warn] DNS {domain} -> {found} (expected {ip})")
 
-    status, body = http_get(ip, be["domain"], health_path, use_ssl)
-    version = None
+    # The health endpoint is password protected; the password lives in the backend .env on the server.
+    headers = {}
+    try:
+        pw = Server(cfg).output(f"grep '^HEALTH_CHECK_PASSWORD=' {shlex.quote(app_dir(be))}/.env | cut -d= -f2-")
+        if pw:
+            headers["X-Health-Check-Token"] = pw
+    except subprocess.CalledProcessError:
+        pass
+    status, body = http_get(ip, be["domain"], health_path, use_ssl, headers=headers)
+    info = None
     if status == 200:
         try:
-            version = json.loads(body).get("version")
+            data = json.loads(body)
+            info = data.get("version") or data.get("status")
         except (ValueError, AttributeError):
             pass
     url = f"{sch}://{be['domain']}{health_path}"
-    if status == 200 and version:
-        report(f"[ok] API {url} -> version {version}")
+    if status == 200 and info:
+        report(f"[ok] API {url} -> {info}")
     else:
         ok = False
         report(f"[fail] API {url} -> {status or body}")
