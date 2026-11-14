@@ -3,7 +3,7 @@ staging:
   username: hossam
   ssh_file: ~/.ssh/google_compute_engine
   docker: false                      # false: systemd + venv (no docker)
-  ssl: false                         # true: install Let's Encrypt certificates (domains must point to this server)
+  ssl: true                          # true: install Let's Encrypt certificates (domains must point to this server)
   ssl_email: hosamameen948@gmail.com # required when ssl: true
 
   # One repo for both projects: same git_url + remote_path, different subdir.
@@ -14,7 +14,7 @@ staging:
     remote_path: /var/www/abosamra/staging   # checkout on the server
     subdir: frontend                         # folder of the Vue project inside the repo
     web_root: /var/www/html/abosamra/staging # nginx serves this folder, it holds only the built dist
-    api_url: http://api.abosamra.hossam-ameen.online
+    api_url: https://api.abosamra.hossam-ameen.online/api/v1
 
   backend:
     domain: api.abosamra.hossam-ameen.online

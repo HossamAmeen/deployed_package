@@ -293,7 +293,7 @@ def resolve_ports(srv, cfg, docker):
 def build_frontend(srv, cfg, docker):
     """Pull the frontend and build/start it. Does not touch the nginx config."""
     fe, be = cfg["frontend"], cfg["backend"]
-    api_url = fe.get("api_url") or f"{scheme(cfg)}://{be['domain']}"
+    api_url = fe.get("api_url") or f"{scheme(cfg)}://{be['domain']}/api/v1"
     port = fe.get("port", 8080)
     dockerfile = fe.get("dockerfile", f"docker/{cfg['_env']}/Dockerfile")
     compose_file = fe.get("compose_file", f"docker/{cfg['_env']}/docker-compose.yml")
